@@ -31,6 +31,24 @@ cc_binary(
   ]
 )
 
+cc_binary(
+  name = "cifar10_test",
+  srcs = ["cifar10_test.cc"],
+  deps = [
+      "//tensorflow/core:tensorflow",
+      "libbufferedrpc.so",
+  ]
+)
+
+cc_binary(
+  name = "inception_test",
+  srcs = ["inception_test.cc"],
+  deps = [
+      "//tensorflow/core:tensorflow",
+      "libbufferedrpc.so",
+  ]
+)
+
 # load("@io_bazel_rules_rust//rust:rust.bzl", "rust_library")
 # 
 # rust_library(
