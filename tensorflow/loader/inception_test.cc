@@ -1,15 +1,12 @@
 #include <atomic>
 #include <cassert>
-#include <chrono>
-#include <thread>
 #include <vector>
 #include <dlfcn.h>
 #include "tensorflow/core/public/session.h"
 #include "tensorflow/core/platform/env.h"
-#include "tensorflow/core/platform/types.h"
 #define FIXEDFLOAT_CODE 2
-#define RECV_BUFFER_SIZE_F64 1000000
-#define SEND_BUFFER_SIZE_F64 100000
+#define RECV_BUFFER_SIZE_F64 5000000
+#define SEND_BUFFER_SIZE_F64 500000
 #define HEADER_OFFSET_F64 2
 
 using namespace tensorflow;
@@ -33,27 +30,6 @@ Status LoadGraph(string graph_file_name, Session** session, std::vector<string>*
   return Status::OK();
 }
 
-void compute_statistics(std::atomic_ulong& pred_counter,
-                        std::atomic_ulong& latency_sum_micros,
-                        std::atomic_ulong& latency_sum_micros_squared,
-                        const std::vector<tensorflow::uint64>& latencies) {
-  std::vector<tensorflow::uint64> my_latencies;
-  while (true) {
-    std::this_thread::sleep_for(std::chrono::seconds(15));
-    my_latencies = latencies;
-    std::sort(my_latencies.begin(), my_latencies.end());
-    tensorflow::uint64 processed_reqs = pred_counter.load();
-    tensorflow::uint64 total_batch_latency = latency_sum_micros.load();
-    tensorflow::uint64 squared_total_batch_latency = latency_sum_micros_squared.load();
-    LOG(INFO) << "Batch latency vals: " << total_batch_latency << " " << squared_total_batch_latency << " " << processed_reqs;
-    double mean_latency = (double) total_batch_latency / (double) processed_reqs;
-    double std_latency = sqrt(((double) processed_reqs * (double) squared_total_batch_latency)  - pow((double) total_batch_latency, 2)) /
-                         (((double) processed_reqs) * ((double) processed_reqs - 1));
-    LOG(INFO) << tensorflow::strings::StrCat(" Mean Latency: ", mean_latency, " Standard deviation: ", std_latency,
-        "  p99 latency: ", my_latencies[(int)(0.99 * my_latencies.size())], "  max latency: ", my_latencies[my_latencies.size() - 1],
-        "  min latency: ", my_latencies[0]);
-  }
-}
 
 
 struct header {
@@ -100,27 +76,27 @@ Model::Model(string model_path, int batch_size) {
 
   tensorflow::TensorShape inputShape;
   inputShape.InsertDim(0, batch_size);
-  inputShape.InsertDim(1, 28);
-  inputShape.InsertDim(2, 28);
+  inputShape.InsertDim(1, 299);
+  inputShape.InsertDim(2, 299);
+  inputShape.InsertDim(3, 3);
 
   input = Tensor(DT_FLOAT, inputShape);
   inputs.push_back(std::pair<string, Tensor>("Placeholder", input));
   std::vector<tensorflow::Tensor> outputs;
 
-  status = session->Run(inputs, {"Softmax"}, {}, &outputs);
+  status = session->Run(inputs, {"inception_v3/logits/predictions"}, {}, &outputs);
   predictions.resize(batch_size);
 }
 
 void Model::predict_floats(
     double *data, int num_inputs, int input_len, double *output_buffer) {
   auto dst = input.flat_outer_dims<float>().data();
-  std::copy(data, data + num_inputs * input_len, dst);
-  // for (int i = 0; i < num_inputs * input_len; i++) {
-  //   dst[i] = (float) data[i];
-  // }
+  for (int i = 0; i < num_inputs * input_len; i++) {
+    dst[i] = (float) data[i];
+  }
 
   std::vector<tensorflow::Tensor> outputs; 
-  session->Run(this->inputs, {"Softmax"}, {}, &outputs);
+  session->Run(this->inputs, {"inception_v3/logits/predictions"}, {}, &outputs);
   auto src = outputs[0].flat_outer_dims<float>().data();
   for (int i = 0; i < num_inputs; i++) {
     output_buffer[i] = (double) src[i];
@@ -169,21 +145,6 @@ void BufferedServer::serve_once() {
 void BufferedServer::handle_connection() {
   LOG(INFO) << "new connection (C++)\n";
   std::vector<double> preds;
-  std::vector<tensorflow::uint64> latencies;
-  latencies.reserve(10);
-  std::atomic_ulong pred_counter;
-  pred_counter.store(0);
-  std::atomic_ulong latency_sum_micros;
-  latency_sum_micros.store(0);
-  std::atomic_ulong latency_sum_micros_squared;
-  latency_sum_micros_squared.store(0);
-  std::thread stats([&]{
-    compute_statistics(pred_counter, latency_sum_micros,
-                       latency_sum_micros_squared, latencies);
-  });
-  //std::thread stats(
-  //  compute_statistics, std::ref(pred_counter), std::ref(latency_sum_micros),
-  //  std::ref(latency_sum_micros_squared), latencies);
 
   bool shutdown = false;
   uint32_t current_batch = 1;
@@ -193,16 +154,14 @@ void BufferedServer::handle_connection() {
   finish_batch finish_fn = (finish_batch) dlsym(this->handle, "finish_batch");
   while (!shutdown) {
     struct header header = (*batch_fn)(this->obj);
-    // assert(header.batch_id == current_batch);
-    // assert(header.code == FIXEDFLOAT_CODE);
+    assert(header.batch_id == current_batch);
+    assert(header.code == FIXEDFLOAT_CODE);
     // Check if sum of inputs is zero
 
     int num_inputs = header.num_inputs;
     int input_len = header.input_len;
 
-    auto start_predict = std::chrono::high_resolution_clock::now();
     this->model->predict_floats(cur_batch_recv_buffer + 2, num_inputs, input_len, cur_batch_send_buffer);
-    auto end_predict = std::chrono::high_resolution_clock::now();
     // assert(preds.size() == num_inputs);
 
     // (*finish_fn)(this->obj, header->batch_id, preds.size());
@@ -220,21 +179,16 @@ void BufferedServer::handle_connection() {
       LOG(ERROR) << "INVALID BATCH NUMBER: " << current_batch;
       return;
     }
-
-    // Append to latencies
-    pred_counter.fetch_add(1, std::memory_order::memory_order_relaxed);
-    auto pred_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_predict - start_predict).count();
-    latency_sum_micros.fetch_add(pred_duration, std::memory_order::memory_order_relaxed);
-    latency_sum_micros_squared.fetch_add(pred_duration * pred_duration, std::memory_order::memory_order_relaxed);
-    latencies.push_back(pred_duration);
   }
 }
 
 int main(int argc, char* argv[]) {
+  std::atomic_ulong latency_sum_micros;
+  latency_sum_micros.store(0);
+  std::atomic_ulong latency_sum_micros_squared;
+  latency_sum_micros_squared.store(0);
   const string model_path(argv[1]);
-  int batch_size = 512;
-  int num_batches = 5000;
-  void* a = (void*) &batch_size;
+  int batch_size = 16;
   void *myso = dlopen("/giulio-local/tf_serving/tensorflow/libbufferedrpc.so", RTLD_NOW);
   init_server init_fn = (init_server) dlsym(myso, "init_server");
   printf("%p\n", init_fn);
