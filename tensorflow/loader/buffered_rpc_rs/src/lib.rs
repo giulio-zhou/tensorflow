@@ -8,7 +8,7 @@ use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
 use std::mem;
 use std::slice;
-// use std::time::Duration;
+use std::time::Duration;
 // use std::thread;
 use std::str;
 use std::ffi::CStr;
@@ -109,6 +109,7 @@ impl Buffer {
 struct Batch {
     recv_buffer: Buffer,
     send_buffer: Buffer,
+    read_start_time: u64,
     status: Arc<Mutex<BatchStatus>>,
     id: u32,
 }
@@ -118,6 +119,7 @@ impl Batch {
         Batch {
             recv_buffer: recv_buffer,
             send_buffer: send_buffer,
+            read_start_time: 0,
             status: Arc::new(Mutex::new(BatchStatus::Read)),
             id: id,
         }
@@ -125,9 +127,86 @@ impl Batch {
     }
 }
 
+// /// Compute the percentile rank of `snapshot`. The rank `p` must
+// /// be in [0.0, 1.0] (inclusive) and `snapshot` must be sorted.
+// ///
+// /// Algorithm is the third variant from
+// /// [Wikipedia](https://en.wikipedia.org/wiki/Percentile)
+// fn percentile(snapshot: &Vec<i64>, p: f64) -> f64 {
+//     assert!(snapshot.len() > 0);
+//     let sample_size = snapshot.len() as f64;
+//     assert!(p >= 0.0 && p <= 1.0, "percentile out of bounds");
+//     let x = if p <= 1.0 / (sample_size + 1.0) {
+//         // println!("a");
+//         1.0
+//     } else if p > 1.0 / (sample_size + 1.0) && p < sample_size / (sample_size + 1.0) {
+//         // println!("b");
+//         p * (sample_size + 1.0)
+//     } else {
+//         // println!("c");
+//         sample_size
+//     };
+//     let index = x.floor() as usize - 1;
+//     let v = snapshot[index] as f64;
+//     let rem = x % 1.0;
+//     let per = if rem != 0.0 {
+//         // println!("rem: {}", rem);
+//         v + rem * (snapshot[index + 1] - snapshot[index]) as f64
+//     } else {
+//         v
+//     };
+//     per
+// }
+
+
+fn compute_stats(snap: &Vec<u64>) -> (f64, f64, f64) {
+    let mean = snap.iter().fold(0, |acc, &x| acc + x) as f64 / snap.len() as f64;
+    let mut var: f64 = snap.iter().fold(0.0, |acc, &x| acc + (x as f64 - mean).powi(2));
+    var = var / (snap.len() - 1) as f64;
+    let mut snap_cpy = snap.to_vec();
+    snap_cpy.sort();
+    let index = (snap_cpy.len() as f64) * 0.99;
+    let p99 = snap_cpy[index as usize] as f64;
+    (mean, var, p99)
+}
+
+
+fn monitor_timing(read_times: Arc<Mutex<Vec<u64>>>, queue_times: Arc<Mutex<Vec<u64>>>) {
+    loop {
+        let report_interval_secs = 20;
+        thread::sleep(Duration::new(report_interval_secs, 0));
+        let rt_snap = {
+            let mut rt_inner = read_times.lock().unwrap();
+            let rt_snap = rt_inner.clone();
+            // rt_inner.clear();
+            rt_snap
+        };
+        let qt_snap = {
+            let mut qt_inner = queue_times.lock().unwrap();
+            let qt_snap = qt_inner.clone();
+            // qt_inner.clear();
+            qt_snap
+        };
+        let (rt_mean, rt_var, rt_p99) = compute_stats(&rt_snap);
+        let (qt_mean, qt_var, qt_p99) = compute_stats(&qt_snap);
+        println!("Read (ms): mean {}, std {}, p99 {}",
+                 rt_mean / 1000.0,
+                 rt_var.sqrt() / 1000.0,
+                 rt_p99 / 1000.0);
+        println!("Queue (ms): mean {}, std {}, p99 {}",
+                 qt_mean / 1000.0,
+                 qt_var.sqrt() / 1000.0,
+                 qt_p99 / 1000.0);
+        // rt_snap.sort();
+        // qt_snap.sort();
+
+    }
+
+}
+
 fn socket_event_loop_run(mut stream: TcpStream,
                          mut batches: Vec<Batch>,
-                         batch_ready: mpsc::Sender<Header>) {
+                         batch_ready: mpsc::Sender<(Header, u64, u64)>) {
 
     let num_batches = batches.len();
     let mut cur_reading_batch = 0;
@@ -145,6 +224,7 @@ fn socket_event_loop_run(mut stream: TcpStream,
                     // Try to read input buffer but don't block
                     // If we finish reading, set status to wait
                     if i == cur_reading_batch {
+                        let maybe_read_start = time::precise_time_ns();
                         // let mut read_buffer = b.recv_buffer.unlock().unwrap();
                         let cur_max_read_size =
                             (b.recv_buffer.get_length() - b.recv_buffer.get_pos()) as u64;
@@ -165,6 +245,11 @@ fn socket_event_loop_run(mut stream: TcpStream,
                         //             b.recv_buffer.get_length());
                         // }
                         // parse header to update length
+
+                        // READ STARTED
+                        if b.recv_buffer.get_pos() == 0 && bytes_read > 0 {
+                            b.read_start_time = maybe_read_start;
+                        }
                         if b.recv_buffer.get_pos() == 0 && bytes_read >= HEADER_LENGTH_BYTES {
                             // parse header
                             let header_slice: &[u32] = unsafe {
@@ -192,6 +277,10 @@ fn socket_event_loop_run(mut stream: TcpStream,
                         // Done reading batch
                         if b.recv_buffer.get_pos() == b.recv_buffer.get_length() &&
                            b.recv_buffer.get_length() >= HEADER_LENGTH_BYTES {
+                            let read_end_time = time::precise_time_ns();
+                            let queue_start_time = time::precise_time_ns();
+
+
                             // set the position back to 0 for reading again
                             b.recv_buffer.set_pos(0);
                             // set the next batch as ready to read
@@ -219,7 +308,8 @@ fn socket_event_loop_run(mut stream: TcpStream,
                             // reset length to just header length
                             b.recv_buffer.set_pos(0);
                             b.recv_buffer.set_length(HEADER_LENGTH_BYTES);
-                            batch_ready.send(h).unwrap();
+                            let read_time = read_end_time - b.read_start_time;
+                            batch_ready.send((h, read_time, queue_start_time)).unwrap();
                         }
                     }
                 }
@@ -266,7 +356,8 @@ pub struct Header {
 
 struct Connection {
     // batches: Vec<Arc<Batch>>,
-    batch_receiver: mpsc::Receiver<Header>,
+    // first u64 is read_time, second is queue_start_time
+    batch_receiver: mpsc::Receiver<(Header, u64, u64)>,
     batch_status: HashMap<u32, Arc<Mutex<BatchStatus>>>,
     current_batch: Option<Header>,
     #[allow(dead_code)]
@@ -275,6 +366,8 @@ struct Connection {
 
 pub struct BufferedServer {
     listener: TcpListener,
+    read_times: Arc<Mutex<Vec<u64>>>,
+    queue_times: Arc<Mutex<Vec<u64>>>,
     connection: Option<Connection>, /* stream: Option<TcpStream>,
                                      * header: Option<Header>, */
 }
@@ -284,6 +377,8 @@ impl BufferedServer {
 
         let mw = BufferedServer {
             listener: TcpListener::bind(address).unwrap(),
+            read_times: Arc::new(Mutex::new(Vec::new())),
+            queue_times: Arc::new(Mutex::new(Vec::new())),
             connection: None, /* stream: None,
                                * header: None, */
         };
@@ -317,11 +412,18 @@ impl BufferedServer {
                 batch_status.insert(b.id, b.status.clone());
             }
 
-            let (sender, receiver) = mpsc::channel::<Header>();
+            let (sender, receiver) = mpsc::channel::<(Header, u64, u64)>();
             let jh = {
                 // let batches = batches.clone();
                 thread::spawn(move || {
                     socket_event_loop_run(stream, batch_vec, sender);
+                })
+            };
+            let mon_jh = {
+                let rt_vec = self.read_times.clone();
+                let qt_vec = self.queue_times.clone();
+                thread::spawn(move || {
+                    monitor_timing(rt_vec, qt_vec);
                 })
             };
             self.connection = Some(Connection {
@@ -340,7 +442,16 @@ impl BufferedServer {
         let mut conn = self.connection.as_mut().unwrap();
         assert!(conn.current_batch.is_none());
         // blocking call to receive
-        let cur_batch_header = conn.batch_receiver.recv().unwrap();
+        let (cur_batch_header, read_time, queue_start_time) = conn.batch_receiver.recv().unwrap();
+        let queue_end_time = time::precise_time_ns();
+        {
+            let mut rt_lock = self.read_times.lock().unwrap();
+            rt_lock.push(read_time);
+        }
+        {
+            let mut qt_lock = self.queue_times.lock().unwrap();
+            qt_lock.push(queue_end_time - queue_start_time);
+        }
         conn.current_batch = Some(cur_batch_header.clone());
         cur_batch_header
     }
